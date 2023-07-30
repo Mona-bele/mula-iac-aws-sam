@@ -19,3 +19,11 @@
 
 # Go workspace file
 go.work
+
+.aws-sam
+.vscode
+app
+env-vars.json
+samconfig.toml
+bin
+bootstrap

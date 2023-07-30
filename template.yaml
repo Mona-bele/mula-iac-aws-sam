@@ -1,0 +1,361 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  mula-aws-sam
+  
+  Sample SAM Template for mula-aws-sam
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 5
+    MemorySize: 128
+    Handler: bootstrap
+    Runtime: provided.al2
+    Architectures: ["arm64"]
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref DynamoDBProductTable
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: Mula API Configuration
+        Parameters:
+          - MulaStageName
+          - MulaAutoDeploy
+      - Label:
+          default: 'Parent Stacks'
+        Parameters:
+          - ParentVPCStack
+      - Label:
+          default: 'RDS Parameters'
+        Parameters:
+            - RDSInstanceType
+            - RDSAllocatedStorage
+            - RDSMasterUsername
+            - RDSMasterUserPassword
+            - DBName
+            - RDSDBInstanceIdentifier
+            - RDSMultiAZ
+            - RDSStorageType
+            - RDSIops
+            - RDSDBParameterGroup
+            - RDSDBSubnetGroupName
+            - RDSDBSecurityGroups
+            - RDSDBSnapshotIdentifier
+            - EngineVersion
+    ParameterLabels:
+      MulaStageName:
+        default: Mula API Stage Name
+      MulaAutoDeploy:
+        default: Auto Deploy API
+
+Parameters:
+  MulaStageName:
+    Type: String
+    Default: dev
+    Description: The name of the stage
+    AllowedValues:
+      - dev
+      - prod
+      - test
+  MulaAutoDeploy:
+    Type: String
+    Default: 'true'
+    Description: Auto deploy the API when changes are made to it
+    AllowedValues:
+      - 'true'
+      - 'false'
+  EngineVersion:
+    Description: 'PostgreSQL version.'
+    Type: String
+    AllowedValues: [ '15.3', '15.2', '14.8', '14.7', '14.4', '14.3', '13.11', '13.10', '13.7', '12.15', '12.14', '12.11', '11.20', '11.19', '11.16' ] # aws rds describe-db-engine-versions --engine postgres --query "DBEngineVersions[].EngineVersion"
+    Default: '14.8'
+  DBInstanceClass:
+    Description: 'The instance type of database server.'
+    Type: String
+    Default: 'db.t2.micro'
+  DBName:
+    Description: 'Name of the database (ignored when DBSnapshotIdentifier is set, value used from snapshot).'
+    Type: String
+    Default: ''
+
+
+Resources:
+  GetProductFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      FunctionName: !Sub "${MulaStageName}-get-product-function"
+      CodeUri: functions/get-products/
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:Scan
+              Resource: !GetAtt DynamoDBProductTable.Arn
+    Metadata:
+      BuildMethod: makefile
+
+  CreateProductFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${MulaStageName}-create-product-function"
+      CodeUri: functions/create-product/
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt DynamoDBProductTable.Arn
+    Metadata:
+      BuildMethod: makefile
+
+    ## =====================================
+    ##          API Gateway
+    ## =====================================
+
+  MulaHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${MulaStageName}-http-api"
+      Description: HTTP API for mula-aws-sam
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowMethods:
+          - GET
+          - POST
+        AllowOrigins:
+          - '*'
+        AllowHeaders:
+          - '*'
+
+  MulaApiAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref MulaHttpApi
+      AuthorizerType: JWT
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Audience:
+          - !Ref CognitoUserPoolClient
+        Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}"
+      Name: !Sub "${MulaStageName}-authorizer"
+
+  MulaGetProductApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MulaHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetProductFunction.Arn}/invocations"
+      IntegrationMethod: POST
+      PayloadFormatVersion: "2.0"
+
+  MulaCreateProductApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MulaHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateProductFunction.Arn}/invocations"
+      IntegrationMethod: POST
+      PayloadFormatVersion: "2.0"
+
+
+  MulaGetProductApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    DependsOn:
+      - MulaGetProductApiIntegration
+    Properties:
+      ApiId: !Ref MulaHttpApi
+      RouteKey: GET /products
+      AuthorizationType: JWT
+      AuthorizerId: !Ref MulaApiAuthorizer
+      Target: !Sub "integrations/${MulaGetProductApiIntegration}"
+
+  MulaCreateProductApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    DependsOn:
+      - MulaCreateProductApiIntegration
+    Properties:
+      ApiId: !Ref MulaHttpApi
+      RouteKey: POST /products
+      AuthorizationType: JWT
+      AuthorizerId: !Ref MulaApiAuthorizer
+      Target: !Sub "integrations/${MulaCreateProductApiIntegration}"
+
+
+  MulaApiDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - MulaGetProductApiRoute
+      - MulaCreateProductApiRoute
+    Properties:
+      ApiId: !Ref MulaHttpApi
+      Description: Deployment for the Mula API
+
+  MulaApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn:
+      - MulaHttpApi
+      - MulaApiDeployment
+    Properties:
+      ApiId: !Ref MulaHttpApi
+      StageName: !Ref MulaStageName
+      AutoDeploy: !Ref MulaAutoDeploy
+      DeploymentId: !Ref MulaApiDeployment
+
+  MulaGetProductApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetProductFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MulaHttpApi}/*/*"
+
+  MulaCreateProductApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateProductFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MulaHttpApi}/*/*"
+
+    ## =====================================
+    ##          PostgreSQl
+    ## =====================================
+  PostgreSQlProductTable:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${MulaStageName}-product-table"
+      DBInstanceClass: db.t2.micro
+      Engine: postgres
+      EngineVersion: 11.5
+      MasterUsername: !Ref MulaDBUsername
+      MasterUserPassword: !Ref MulaDBPassword
+      AllocatedStorage: 20
+      DBName: !Ref MulaDBName
+      PubliclyAccessible: true
+      MultiAZ: false
+      VPCSecurityGroups:
+        - !Ref MulaDBSecurityGroup
+      DBSubnetGroupName: !Ref MulaDBSubnetGroup
+      ServiceToken: !GetAtt RDSProxyFunction.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${MulaStageName}-product-table"
+
+
+
+
+
+    ## =====================================
+    ##          Cognito
+    ## =====================================
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${MulaStageName}-user-pool"
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      MfaConfiguration: 'OFF'
+      UsernameConfiguration:
+        CaseSensitive: false
+      UserPoolAddOns:
+        AdvancedSecurityMode: 'OFF'
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 6
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      Schema:
+        - AttributeDataType: String
+          DeveloperOnlyAttribute: false
+          Mutable: false
+          Name: email
+          Required: true
+          StringAttributeConstraints:
+            MaxLength: "2048"
+            MinLength: "0"
+        - AttributeDataType: String
+          DeveloperOnlyAttribute: false
+          Mutable: false
+          Name: sub
+          Required: true
+          StringAttributeConstraints:
+            MaxLength: "2048"
+            MinLength: "0"
+        - AttributeDataType: Boolean
+          DeveloperOnlyAttribute: false
+          Mutable: true
+          Name: email_verified
+          Required: false
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${MulaStageName}-user-pool-client"
+      UserPoolId: !Ref CognitoUserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_CUSTOM_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_CUSTOM_AUTH
+      GenerateSecret: false
+      RefreshTokenValidity: 30
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: days
+        IdToken: days
+        RefreshToken: days
+      PreventUserExistenceErrors: ENABLED
+
+  # test user
+  UserPoolUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Username: "pl1745240@gmail.com"
+      DesiredDeliveryMediums:
+        - EMAIL
+
+Outputs:
+  # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
+  # Find out more about other implicit resources you can reference within SAM
+  # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
+  MulaHttpApi:
+    Description: "API Gateway endpoint URL for Prod environment for First Function"
+    Value: !Sub "https://${MulaHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${MulaStageName}/"
+  GetProductFunction:
+    Description: "First Lambda Function ARN"
+    Value: !GetAtt GetProductFunction.Arn
+  ProductFunctionIamRole:
+    Description: "Implicit IAM Role created for Hello World function"
+    Value: !GetAtt GetProductFunctionRole.Arn
+  CognitoUserPool:
+    Description: "Cognito User Pool"
+    Value: !Ref CognitoUserPool
+  CognitoUserPoolClient:
+    Description: "Cognito User Pool Client"
+    Value: !Ref CognitoUserPoolClient
+  DynamoDBProductTable:
+    Description: "DynamoDB Product Table"
+    Value: !Ref DynamoDBProductTable
